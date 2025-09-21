@@ -1,0 +1,331 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Secure Text Transfer - Demo</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+ <link rel="stylesheet" href="style.css">
+
+</head>
+<body>
+  <h1>Secure Text Transfer — Minimal E2E Demo</h1>
+
+  <div class="box">
+    <h3>1) Create identity & register</h3>
+    <label>Username</label>
+    <input id="reg-username" placeholder="alice" />
+    <label>Passphrase (optional — encrypt your private key locally)</label>
+    <input id="reg-pass" placeholder="type a strong passphrase (optional)" />
+    <div style="margin-top:10px;">
+      <button id="btn-generate">Generate Keypair & Register</button>
+    </div>
+    <div style="margin-top:8px;">
+      <small>When you register, the client uploads only your public key. The server returns an API token which you use to send & fetch messages.</small>
+    </div>
+    <div style="margin-top:8px;">
+      <strong>Your API token (store it, saved to localStorage for demo):</strong>
+      <div id="token" class="log"></div>
+    </div>
+  </div>
+
+  <div class="box">
+    <h3>2) Send message</h3>
+    <label>From (your username)</label>
+    <input id="from" />
+    <label>To (recipient username)</label>
+    <input id="to" />
+    <label>Message</label>
+    <textarea id="message"></textarea>
+    <button id="btn-send">Encrypt & Send</button>
+    <div style="margin-top:8px;"><small>The client fetches recipient public key, encrypts with AES-GCM, encrypts AES key with recipient's RSA public key, then sends encrypted blobs to server.</small></div>
+  </div>
+
+  <div class="box">
+    <h3>3) Inbox — fetch & decrypt</h3>
+    <label>Username to fetch messages for</label>
+    <input id="inbox-username" />
+    <label>Passphrase (if you encrypted your private key)</label>
+    <input id="inbox-pass" placeholder="passphrase (if used earlier)" />
+    <button id="btn-inbox">Fetch & Decrypt</button>
+    <div id="messages" style="margin-top:10px;"></div>
+  </div>
+
+  <div class="box">
+    <h3>4) Debug / actions</h3>
+    <div class="row">
+      <div class="col"><button id="btn-users">List registered users</button></div>
+      <div class="col"><button id="btn-clear">Clear saved local keys/token</button></div>
+    </div>
+    <div id="debug" class="log" style="margin-top:8px;"></div>
+  </div>
+
+<script>
+/* Helpers for base64 <-> ArrayBuffer */
+function arrayBufferToBase64(buffer) {
+  const bytes = new Uint8Array(buffer);
+  let binary = '';
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+  }
+  return btoa(binary);
+}
+function base64ToArrayBuffer(b64) {
+  const binary = atob(b64);
+  const len = binary.length;
+  const bytes = new Uint8Array(len);
+  for (let i = 0; i < len; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes.buffer;
+}
+
+/* PEM helpers */
+function wrapPem(base64Str, label) {
+  const lines = base64Str.match(/.{1,64}/g).join('\n');
+  return `-----BEGIN ${label}-----\n${lines}\n-----END ${label}-----`;
+}
+function pemToArrayBuffer(pem) {
+  const b64 = pem.replace(/-----.*-----/g, '').replace(/\s+/g, '');
+  return base64ToArrayBuffer(b64);
+}
+
+/* Export/import RSA keys to PEM */
+async function exportPublicKeyToPem(key) {
+  const spki = await crypto.subtle.exportKey('spki', key);
+  const b64 = arrayBufferToBase64(spki);
+  return wrapPem(b64, 'PUBLIC KEY');
+}
+async function exportPrivateKeyToPem(key) {
+  const pkcs8 = await crypto.subtle.exportKey('pkcs8', key);
+  const b64 = arrayBufferToBase64(pkcs8);
+  return wrapPem(b64, 'PRIVATE KEY');
+}
+async function importPublicKeyFromPem(pem) {
+  const ab = pemToArrayBuffer(pem);
+  return crypto.subtle.importKey('spki', ab, { name: 'RSA-OAEP', hash: 'SHA-256' }, true, ['encrypt']);
+}
+async function importPrivateKeyFromPem(pem) {
+  const ab = pemToArrayBuffer(pem);
+  return crypto.subtle.importKey('pkcs8', ab, { name: 'RSA-OAEP', hash: 'SHA-256' }, true, ['decrypt']);
+}
+
+/* Generate RSA keypair and return PEMs */
+async function generateKeyPairPEM() {
+  const kp = await crypto.subtle.generateKey(
+    { name: 'RSA-OAEP', modulusLength: 2048, publicExponent: new Uint8Array([1,0,1]), hash: 'SHA-256' },
+    true, ['encrypt','decrypt']
+  );
+  const pubPem = await exportPublicKeyToPem(kp.publicKey);
+  const privPem = await exportPrivateKeyToPem(kp.privateKey);
+  return { pubPem, privPem };
+}
+
+/* Hybrid encryption: AES-GCM for message, RSA-OAEP for AES key */
+async function encryptHybrid(recipientPublicPem, plainText) {
+  const publicKey = await importPublicKeyFromPem(recipientPublicPem);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const aesKey = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, true, ['encrypt','decrypt']);
+  const encoded = new TextEncoder().encode(plainText);
+  const ciphertext = await crypto.subtle.encrypt({ name:'AES-GCM', iv }, aesKey, encoded);
+  const rawAes = await crypto.subtle.exportKey('raw', aesKey);
+  const encryptedKey = await crypto.subtle.encrypt({ name: 'RSA-OAEP' }, publicKey, rawAes);
+  return {
+    ciphertext: arrayBufferToBase64(ciphertext),
+    encryptedKey: arrayBufferToBase64(encryptedKey),
+    iv: arrayBufferToBase64(iv.buffer)
+  };
+}
+
+/* Decrypt hybrid: RSA decrypt AES key, then AES decrypt message */
+async function decryptHybrid(privatePem, encryptedKeyB64, ciphertextB64, ivB64) {
+  const privateKey = await importPrivateKeyFromPem(privatePem);
+  const encryptedKeyAb = base64ToArrayBuffer(encryptedKeyB64);
+  const rawAes = await crypto.subtle.decrypt({ name:'RSA-OAEP' }, privateKey, encryptedKeyAb);
+  const aesKey = await crypto.subtle.importKey('raw', rawAes, { name:'AES-GCM' }, false, ['decrypt']);
+  const iv = new Uint8Array(base64ToArrayBuffer(ivB64));
+  const plaintextAB = await crypto.subtle.decrypt({ name:'AES-GCM', iv }, aesKey, base64ToArrayBuffer(ciphertextB64));
+  return new TextDecoder().decode(plaintextAB);
+}
+
+/* Encrypt private key PEM with a passphrase (PBKDF2 -> AES-GCM) */
+async function deriveKeyFromPassword(password, salt) {
+  const enc = new TextEncoder();
+  const baseKey = await crypto.subtle.importKey('raw', enc.encode(password), 'PBKDF2', false, ['deriveKey']);
+  return crypto.subtle.deriveKey(
+    { name:'PBKDF2', salt, iterations: 100000, hash: 'SHA-256' },
+    baseKey,
+    { name:'AES-GCM', length: 256 },
+    false,
+    ['encrypt','decrypt']
+  );
+}
+async function encryptPrivatePem(privatePem, password) {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const key = await deriveKeyFromPassword(password, salt);
+  const enc = new TextEncoder();
+  const ciphertext = await crypto.subtle.encrypt({ name:'AES-GCM', iv }, key, enc.encode(privatePem));
+  return { ciphertext: arrayBufferToBase64(ciphertext), salt: arrayBufferToBase64(salt.buffer), iv: arrayBufferToBase64(iv.buffer) };
+}
+async function decryptPrivatePem(encryptedObj, password) {
+  const salt = new Uint8Array(base64ToArrayBuffer(encryptedObj.salt));
+  const iv = new Uint8Array(base64ToArrayBuffer(encryptedObj.iv));
+  const key = await deriveKeyFromPassword(password, salt);
+  const plainAB = await crypto.subtle.decrypt({ name:'AES-GCM', iv }, key, base64ToArrayBuffer(encryptedObj.ciphertext));
+  return new TextDecoder().decode(plainAB);
+}
+
+/* UI wiring */
+const $ = id => document.getElementById(id);
+const dbg = txt => { $('debug').textContent = txt; };
+
+async function doGenerateAndRegister() {
+  const username = $('reg-username').value.trim();
+  const pass = $('reg-pass').value;
+  if (!username) return alert('enter username');
+
+  dbg('Generating RSA keypair (in browser)...');
+  const { pubPem, privPem } = await generateKeyPairPEM();
+  dbg('Keypair generated. Registering public key with server...');
+
+  const r = await fetch('/api/register', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username, publicKeyPem: pubPem })
+  });
+  const js = await r.json();
+  if (!r.ok) return alert('register failed: ' + (js.error || JSON.stringify(js)));
+
+  const token = js.token;
+  // save token and key locally (demo)
+  localStorage.setItem('secure_demo_token_' + username, token);
+
+  if (pass) {
+    const encrypted = await encryptPrivatePem(privPem, pass);
+    encrypted._isEncrypted = true;
+    localStorage.setItem('secure_demo_priv_' + username, JSON.stringify(encrypted));
+    localStorage.setItem('secure_demo_pub_' + username, pubPem);
+    dbg('Private key encrypted with passphrase and saved to localStorage.');
+  } else {
+    localStorage.setItem('secure_demo_priv_' + username, JSON.stringify({ _isEncrypted: false, pem: privPem }));
+    localStorage.setItem('secure_demo_pub_' + username, pubPem);
+    dbg('Private key saved in localStorage (UNENCRYPTED). Use passphrase to protect it.');
+  }
+  $('token').textContent = token;
+  alert('Registered! token saved to localStorage for demo. Keep it safe.');
+
+  $('reg-username').value = '';
+  $('reg-pass').value = '';
+}
+
+async function doSend() {
+  const from = $('from').value.trim();
+  const to = $('to').value.trim();
+  const message = $('message').value;
+  if (!from || !to || !message) return alert('from, to and message required');
+
+  const token = localStorage.getItem('secure_demo_token_' + from);
+  if (!token) return alert('no saved token for sender. Register first.');
+
+  dbg('Fetching recipient public key...');
+  const rpk = await fetch('/api/publicKey/' + encodeURIComponent(to));
+  if (!rpk.ok) return alert('failed to get recipient public key: ' + (await rpk.text()));
+  const { publicKeyPem } = await rpk.json();
+
+  dbg('Encrypting message locally...');
+  const { ciphertext, encryptedKey, iv } = await encryptHybrid(publicKeyPem, message);
+
+  dbg('Sending encrypted blobs to server...');
+  const r = await fetch('/api/send', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-api-key': token },
+    body: JSON.stringify({ from, to, ciphertext, encryptedKey, iv })
+  });
+  const js = await r.json();
+  if (!r.ok) return alert('send failed: ' + (js.error || JSON.stringify(js)));
+
+  dbg('Message sent (server stores encrypted blobs).');
+  alert('Message encrypted & sent!');
+  $('message').value = '';
+
+   $('from').value = '';
+  $('to').value = '';
+  $('message').value = '';
+}
+
+async function doInbox() {
+  const username = $('inbox-username').value.trim();
+  const pass = $('inbox-pass').value;
+  if (!username) return alert('enter username');
+  const token = localStorage.getItem('secure_demo_token_' + username);
+  if (!token) return alert('no token for this username. Register first.');
+
+  dbg('Fetching encrypted messages from server...');
+  const r = await fetch('/api/messages/' + encodeURIComponent(username), {
+    headers: { 'x-api-key': token }
+  });
+  if (!r.ok) return alert('fetch messages failed: ' + (await r.text()));
+  const { messages } = await r.json();
+  if (!messages || messages.length === 0) { $('messages').innerHTML = '<em>No messages</em>'; dbg('No messages'); return; }
+
+  // get private key from localStorage
+  const saved = localStorage.getItem('secure_demo_priv_' + username);
+  if (!saved) return alert('private key not saved locally for this user (demo).');
+
+  let privPem;
+  const obj = JSON.parse(saved);
+  if (obj._isEncrypted) {
+    if (!pass) return alert('this private key is encrypted locally. enter passphrase to decrypt.');
+    try {
+      privPem = await decryptPrivatePem(obj, pass);
+    } catch (e) {
+      return alert('failed to decrypt private key (wrong passphrase?)');
+    }
+  } else {
+    privPem = obj.pem;
+  }
+
+  // decrypt each message
+  const out = [];
+  for (const m of messages) {
+    try {
+      const text = await decryptHybrid(privPem, m.encryptedKey, m.ciphertext, m.iv);
+      out.push(`<div style="border-bottom:1px dashed #ddd;padding:8px 0;"><strong>From:</strong> ${m.from}<br/><strong>At:</strong> ${m.timestamp}<br/><strong>Message:</strong><div style="margin-top:6px">${escapeHtml(text)}</div></div>`);
+    } catch (e) {
+      out.push(`<div style="color:crimson">Failed to decrypt message from ${m.from} (maybe wrong key). Raw stored payload: ${JSON.stringify({from:m.from,timestamp:m.timestamp})}</div>`);
+    }
+  }
+  $('messages').innerHTML = out.join('');
+  dbg('Decryption done locally.');
+
+   $('inbox-username').value = '';
+  $('inbox-pass').value = '';
+}
+
+function escapeHtml(s) {
+  return s.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+async function listUsers() {
+  const r = await fetch('/api/users');
+  const js = await r.json();
+  $('debug').textContent = 'Registered users:\n' + (js.users || []).join('\n');
+}
+
+function clearLocal() {
+  if (!confirm('Clear all locally saved tokens & keys for demo?')) return;
+  Object.keys(localStorage).forEach(k => {
+    if (k.startsWith('secure_demo_')) localStorage.removeItem(k);
+  });
+  $('token').textContent = '';
+  $('debug').textContent = 'cleared secure_demo_* from localStorage';
+}
+
+/* events */
+$('btn-generate').addEventListener('click', () => { doGenerateAndRegister().catch(e => { console.error(e); alert('error: ' + e.message); }); });
+$('btn-send').addEventListener('click', () => { doSend().catch(e => { console.error(e); alert('error: ' + e.message); }); });
+$('btn-inbox').addEventListener('click', () => { doInbox().catch(e => { console.error(e); alert('error: ' + e.message); }); });
+$('btn-users').addEventListener('click', () => { listUsers().catch(e => { console.error(e); alert('error: ' + e.message); }); });
+$('btn-clear').addEventListener('click', clearLocal);
+</script>
+</body>
+</html>
