@@ -4,8 +4,22 @@
   <meta charset="utf-8" />
   <title>Secure Text Transfer - Demo</title>
   <meta name="viewport" content="width=device-width,initial-scale=1" />
- <link rel="stylesheet" href="style.css">
-
+  <link rel="stylesheet" href="style.css">
+  <style>
+    .log { 
+      background: #f9f9f9; 
+      border: 1px solid #ccc; 
+      padding: 6px 10px; 
+      font-family: monospace; 
+      font-size: 13px; 
+      border-radius: 4px;
+      white-space: pre-wrap;
+      word-wrap: break-word;
+    }
+    .msg-success { color: green; }
+    .msg-error { color: crimson; }
+    .msg-warning { color: orange; }
+  </style>
 </head>
 <body>
   <h1>Secure Text Transfer — Minimal E2E Demo</h1>
@@ -19,9 +33,7 @@
     <div style="margin-top:10px;">
       <button id="btn-generate">Generate Keypair & Register</button>
     </div>
-    <div style="margin-top:8px;">
-      <small>When you register, the client uploads only your public key. The server returns an API token which you use to send & fetch messages.</small>
-    </div>
+    <div id="reg-msg" class="log" style="margin-top:8px;"></div>
     <div style="margin-top:8px;">
       <strong>Your API token (store it, saved to localStorage for demo):</strong>
       <div id="token" class="log"></div>
@@ -37,6 +49,7 @@
     <label>Message</label>
     <textarea id="message"></textarea>
     <button id="btn-send">Encrypt & Send</button>
+    <div id="send-msg" class="log" style="margin-top:8px;"></div>
     <div style="margin-top:8px;"><small>The client fetches recipient public key, encrypts with AES-GCM, encrypts AES key with recipient's RSA public key, then sends encrypted blobs to server.</small></div>
   </div>
 
@@ -47,6 +60,7 @@
     <label>Passphrase (if you encrypted your private key)</label>
     <input id="inbox-pass" placeholder="passphrase (if used earlier)" />
     <button id="btn-inbox">Fetch & Decrypt</button>
+    <div id="inbox-msg" class="log" style="margin-top:8px;"></div>
     <div id="messages" style="margin-top:10px;"></div>
   </div>
 
@@ -54,7 +68,7 @@
     <h3>4) Debug / actions</h3>
     <div class="row">
       <div class="col"><button id="btn-users">List registered users</button></div>
-      <div class="col"><button id="btn-clear">Clear saved local keys/token</button></div>
+      <!-- <div class="col"><button id="btn-clear">Clear saved local keys/token</button></div> -->
     </div>
     <div id="debug" class="log" style="margin-top:8px;"></div>
   </div>
@@ -178,10 +192,17 @@ async function decryptPrivatePem(encryptedObj, password) {
 const $ = id => document.getElementById(id);
 const dbg = txt => { $('debug').textContent = txt; };
 
+function showMsg(id, txt, type='success') {
+  const el = $(id);
+  el.textContent = txt;
+  el.className = `log msg-${type}`;
+}
+
 async function doGenerateAndRegister() {
   const username = $('reg-username').value.trim();
   const pass = $('reg-pass').value;
-  if (!username) return alert('enter username');
+  $('reg-msg').textContent = '';
+  if (!username) return showMsg('reg-msg','Please enter username','warning');
 
   dbg('Generating RSA keypair (in browser)...');
   const { pubPem, privPem } = await generateKeyPairPEM();
@@ -193,10 +214,9 @@ async function doGenerateAndRegister() {
     body: JSON.stringify({ username, publicKeyPem: pubPem })
   });
   const js = await r.json();
-  if (!r.ok) return alert('register failed: ' + (js.error || JSON.stringify(js)));
+  if (!r.ok) return showMsg('reg-msg','Register failed: ' + (js.error || JSON.stringify(js)),'error');
 
   const token = js.token;
-  // save token and key locally (demo)
   localStorage.setItem('secure_demo_token_' + username, token);
 
   if (pass) {
@@ -204,15 +224,14 @@ async function doGenerateAndRegister() {
     encrypted._isEncrypted = true;
     localStorage.setItem('secure_demo_priv_' + username, JSON.stringify(encrypted));
     localStorage.setItem('secure_demo_pub_' + username, pubPem);
-    dbg('Private key encrypted with passphrase and saved to localStorage.');
+    showMsg('reg-msg','Private key encrypted with passphrase and saved locally','success');
   } else {
     localStorage.setItem('secure_demo_priv_' + username, JSON.stringify({ _isEncrypted: false, pem: privPem }));
     localStorage.setItem('secure_demo_pub_' + username, pubPem);
-    dbg('Private key saved in localStorage (UNENCRYPTED). Use passphrase to protect it.');
+    showMsg('reg-msg','Registered✅','success');
   }
-  $('token').textContent = token;
-  alert('Registered! token saved to localStorage for demo. Keep it safe.');
 
+  $('token').textContent = token;
   $('reg-username').value = '';
   $('reg-pass').value = '';
 }
@@ -221,14 +240,15 @@ async function doSend() {
   const from = $('from').value.trim();
   const to = $('to').value.trim();
   const message = $('message').value;
-  if (!from || !to || !message) return alert('from, to and message required');
+  $('send-msg').textContent = '';
+  if (!from || !to || !message) return showMsg('send-msg','From, To and Message are required','warning');
 
   const token = localStorage.getItem('secure_demo_token_' + from);
-  if (!token) return alert('no saved token for sender. Register first.');
+  if (!token) return showMsg('send-msg','No saved token for sender. Register first.','error');
 
   dbg('Fetching recipient public key...');
   const rpk = await fetch('/api/publicKey/' + encodeURIComponent(to));
-  if (!rpk.ok) return alert('failed to get recipient public key: ' + (await rpk.text()));
+  if (!rpk.ok) return showMsg('send-msg','Failed to get recipient public key','error');
   const { publicKeyPem } = await rpk.json();
 
   dbg('Encrypting message locally...');
@@ -241,13 +261,10 @@ async function doSend() {
     body: JSON.stringify({ from, to, ciphertext, encryptedKey, iv })
   });
   const js = await r.json();
-  if (!r.ok) return alert('send failed: ' + (js.error || JSON.stringify(js)));
+  if (!r.ok) return showMsg('send-msg','Send failed: ' + (js.error || JSON.stringify(js)),'error');
 
-  dbg('Message sent (server stores encrypted blobs).');
-  alert('Message encrypted & sent!');
-  $('message').value = '';
-
-   $('from').value = '';
+  showMsg('send-msg','Message encrypted & sent!','success');
+  $('from').value = '';
   $('to').value = '';
   $('message').value = '';
 }
@@ -255,49 +272,55 @@ async function doSend() {
 async function doInbox() {
   const username = $('inbox-username').value.trim();
   const pass = $('inbox-pass').value;
-  if (!username) return alert('enter username');
+  $('inbox-msg').textContent = '';
+  if (!username) return showMsg('inbox-msg','Enter username','warning');
+
   const token = localStorage.getItem('secure_demo_token_' + username);
-  if (!token) return alert('no token for this username. Register first.');
+  if (!token) return showMsg('inbox-msg','No token for this username. Register first.','error');
 
   dbg('Fetching encrypted messages from server...');
   const r = await fetch('/api/messages/' + encodeURIComponent(username), {
     headers: { 'x-api-key': token }
   });
-  if (!r.ok) return alert('fetch messages failed: ' + (await r.text()));
-  const { messages } = await r.json();
-  if (!messages || messages.length === 0) { $('messages').innerHTML = '<em>No messages</em>'; dbg('No messages'); return; }
+  if (!r.ok) return showMsg('inbox-msg','Fetch messages failed','error');
 
-  // get private key from localStorage
+  const { messages } = await r.json();
+  if (!messages || messages.length === 0) {
+    $('messages').innerHTML = '<em>No messages</em>';
+    dbg('No messages');
+    return showMsg('inbox-msg','No messages found','success');
+  }
+
   const saved = localStorage.getItem('secure_demo_priv_' + username);
-  if (!saved) return alert('private key not saved locally for this user (demo).');
+  if (!saved) return showMsg('inbox-msg','Private key not saved locally for this user','error');
 
   let privPem;
   const obj = JSON.parse(saved);
   if (obj._isEncrypted) {
-    if (!pass) return alert('this private key is encrypted locally. enter passphrase to decrypt.');
+    if (!pass) return showMsg('inbox-msg','Private key is encrypted. Enter passphrase','warning');
     try {
       privPem = await decryptPrivatePem(obj, pass);
     } catch (e) {
-      return alert('failed to decrypt private key (wrong passphrase?)');
+      return showMsg('inbox-msg','Failed to decrypt private key (wrong passphrase?)','error');
     }
   } else {
     privPem = obj.pem;
   }
 
-  // decrypt each message
   const out = [];
   for (const m of messages) {
     try {
       const text = await decryptHybrid(privPem, m.encryptedKey, m.ciphertext, m.iv);
       out.push(`<div style="border-bottom:1px dashed #ddd;padding:8px 0;"><strong>From:</strong> ${m.from}<br/><strong>At:</strong> ${m.timestamp}<br/><strong>Message:</strong><div style="margin-top:6px">${escapeHtml(text)}</div></div>`);
     } catch (e) {
-      out.push(`<div style="color:crimson">Failed to decrypt message from ${m.from} (maybe wrong key). Raw stored payload: ${JSON.stringify({from:m.from,timestamp:m.timestamp})}</div>`);
+      out.push(`<div style="color:crimson">Failed to decrypt message from ${m.from}. Raw payload: ${JSON.stringify({from:m.from,timestamp:m.timestamp})}</div>`);
     }
   }
   $('messages').innerHTML = out.join('');
   dbg('Decryption done locally.');
+  showMsg('inbox-msg','Decryption completed','success');
 
-   $('inbox-username').value = '';
+  $('inbox-username').value = '';
   $('inbox-pass').value = '';
 }
 
@@ -317,15 +340,16 @@ function clearLocal() {
     if (k.startsWith('secure_demo_')) localStorage.removeItem(k);
   });
   $('token').textContent = '';
-  $('debug').textContent = 'cleared secure_demo_* from localStorage';
+  $('debug').textContent = 'Cleared';
+
 }
 
 /* events */
-$('btn-generate').addEventListener('click', () => { doGenerateAndRegister().catch(e => { console.error(e); alert('error: ' + e.message); }); });
-$('btn-send').addEventListener('click', () => { doSend().catch(e => { console.error(e); alert('error: ' + e.message); }); });
-$('btn-inbox').addEventListener('click', () => { doInbox().catch(e => { console.error(e); alert('error: ' + e.message); }); });
-$('btn-users').addEventListener('click', () => { listUsers().catch(e => { console.error(e); alert('error: ' + e.message); }); });
-$('btn-clear').addEventListener('click', clearLocal);
+$('btn-generate').addEventListener('click', () => { doGenerateAndRegister().catch(e => showMsg('reg-msg',e.message,'error')); });
+$('btn-send').addEventListener('click', () => { doSend().catch(e => showMsg('send-msg',e.message,'error')); });
+$('btn-inbox').addEventListener('click', () => { doInbox().catch(e => showMsg('inbox-msg',e.message,'error')); });
+$('btn-users').addEventListener('click', () => { listUsers().catch(e => showMsg('debug',e.message,'error')); });
+
 </script>
 </body>
 </html>
